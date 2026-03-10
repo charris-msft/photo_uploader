@@ -5,7 +5,6 @@ Handles environment configuration and application initialization
 """
 
 import os
-import sys
 import logging
 import platform
 from pathlib import Path
@@ -50,13 +49,8 @@ def setup_logging():
 
 def validate_environment():
     """Validate required environment variables"""
-    required_vars = ['AZURE_STORAGE_ACCOUNT_NAME']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        print(f"[ERROR] Missing required environment variables: {', '.join(missing_vars)}")
-        print("[INFO] Please set the required environment variables or run 'azd up' to deploy infrastructure first.")
-        sys.exit(1)
+    # Set defaults for optional variables
+    os.environ.setdefault('UPLOAD_DIR', 'uploads')
 
 def main():
     """Main startup function"""
@@ -66,19 +60,16 @@ def main():
     validate_environment()
     
     # Set default values for optional environment variables
-    os.environ.setdefault('AZURE_PHOTO_CONTAINER_NAME', 'photos')
     os.environ.setdefault('APP_HOST', '0.0.0.0')
     os.environ.setdefault('APP_PORT', '8000')
     
     # Use platform-appropriate logging messages
     if platform.system() == 'Windows':
         logger.info("[OK] Environment validation passed")
-        logger.info(f"[STORAGE] Storage Account: {os.getenv('AZURE_STORAGE_ACCOUNT_NAME')}")
-        logger.info(f"[CONTAINER] Container: {os.getenv('AZURE_PHOTO_CONTAINER_NAME')}")
+        logger.info(f"[STORAGE] Upload directory: {os.getenv('UPLOAD_DIR')}")
     else:
         logger.info("✅ Environment validation passed")
-        logger.info(f"📦 Storage Account: {os.getenv('AZURE_STORAGE_ACCOUNT_NAME')}")
-        logger.info(f"🗂️ Container: {os.getenv('AZURE_PHOTO_CONTAINER_NAME')}")
+        logger.info(f"📁 Upload directory: {os.getenv('UPLOAD_DIR')}")
     
     # Import and run the FastAPI application
     import uvicorn

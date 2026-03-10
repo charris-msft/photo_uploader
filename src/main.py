@@ -1,31 +1,24 @@
 """
 Secure FastAPI Photo Uploader
-A production-ready FastAPI application for uploading photos to Azure Blob Storage
-using managed identity and RBAC for authentication.
+A production-ready FastAPI application for uploading photos to local storage.
 """
 
 import os
 import uuid
+import json
 import logging
 import platform
 from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 
+import aiofiles
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-
-from azure.storage.blob.aio import BlobServiceClient
-from azure.identity.aio import (
-    DefaultAzureCredential, ChainedTokenCredential, 
-    AzureCliCredential, ManagedIdentityCredential
-)
-from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError, ServiceRequestError
-from azure.storage.blob import ContentSettings
 
 # Configure logging
 logging.basicConfig(
@@ -48,18 +41,11 @@ def safe_log(level: str, message: str, emoji: str = "", alt_prefix: str = ""):
 
 # Configuration
 class Config:
-    """Application configuration with Azure best practices"""
+    """Application configuration"""
     
     def __init__(self):
-        self.storage_account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
-        self.container_name = os.getenv("AZURE_PHOTO_CONTAINER_NAME", "photos")
-        self.user_assigned_identity_client_id = os.getenv("AZURE_USER_ASSIGNED_IDENTITY_CLIENT_ID")
-        
-        # Validation
-        if not self.storage_account_name:
-            raise ValueError("AZURE_STORAGE_ACCOUNT_NAME environment variable is required")
-        
-        self.storage_account_url = f"https://{self.storage_account_name}.blob.core.windows.net"
+        self.upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads"))
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
         
         # File upload limits
         self.max_file_size = 100 * 1024 * 1024  # 100MB
@@ -74,7 +60,7 @@ config = Config()
 # Initialize FastAPI app
 app = FastAPI(
     title="🖼️ Secure Photo Uploader",
-    description="A secure FastAPI application for uploading photos to Azure Blob Storage",
+    description="A secure FastAPI application for uploading photos to local storage",
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
@@ -94,48 +80,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 class SecurePhotoUploader:
-    """Secure photo uploader using Azure managed identity and RBAC"""
+    """Secure photo uploader using local filesystem storage"""
     
     def __init__(self):
         self.config = config
-        self._blob_service_client = None
-        self._credential = None
         
-    async def _get_credential(self):
-        """Get Azure credential with managed identity preference"""
-        if self._credential is None:
-            try:
-                if self.config.user_assigned_identity_client_id:
-                    # Use user-assigned managed identity
-                    managed_identity_credential = ManagedIdentityCredential(
-                        client_id=self.config.user_assigned_identity_client_id
-                    )
-                    self._credential = ChainedTokenCredential(
-                        managed_identity_credential,
-                        AzureCliCredential(),
-                        DefaultAzureCredential()
-                    )
-                else:
-                    # Fall back to default credential chain
-                    self._credential = DefaultAzureCredential()
-                    
-                safe_log("info", "Azure credential initialized successfully", "✅", "SUCCESS")
-            except Exception as e:
-                safe_log("error", f"Failed to initialize Azure credential: {e}", "❌", "ERROR")
-                raise ClientAuthenticationError("Failed to initialize Azure credentials")
-                
-        return self._credential
-    
-    async def _get_blob_service_client(self):
-        """Get authenticated blob service client"""
-        if self._blob_service_client is None:
-            credential = await self._get_credential()
-            self._blob_service_client = BlobServiceClient(
-                account_url=self.config.storage_account_url,
-                credential=credential
-            )
-        return self._blob_service_client
-    
     def _validate_file(self, file: UploadFile) -> None:
         """Validate uploaded file"""
         # Check file extension
@@ -155,7 +104,7 @@ class SecurePhotoUploader:
             )
     
     def _generate_blob_name(self, original_filename: str) -> str:
-        """Generate a unique blob name with timestamp and UUID"""
+        """Generate a unique file path with timestamp and UUID"""
         timestamp = datetime.utcnow().strftime("%Y/%m/%d")
         file_extension = Path(original_filename).suffix.lower()
         unique_id = str(uuid.uuid4())[:8]
@@ -172,12 +121,12 @@ class SecurePhotoUploader:
         blob_name: Optional[str] = None,
         tags: Optional[dict] = None
     ) -> dict:
-        """Upload photo to Azure Blob Storage with error handling and retry logic"""
+        """Upload photo to local storage"""
         try:
             # Validate file
             self._validate_file(file)
             
-            # Generate blob name if not provided
+            # Generate file path if not provided
             if not blob_name:
                 blob_name = self._generate_blob_name(file.filename or f"photo_{uuid.uuid4()}")
             
@@ -195,48 +144,35 @@ class SecurePhotoUploader:
             if file_size == 0:
                 raise HTTPException(status_code=400, detail="Empty file not allowed")
             
-            # Get blob service client
-            blob_service_client = await self._get_blob_service_client()
-            blob_client = blob_service_client.get_blob_client(
-                container=self.config.container_name,
-                blob=blob_name
-            )
+            # Ensure target directory exists
+            target_path = self.config.upload_dir / blob_name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Set content settings
-            content_settings = ContentSettings(
-                content_type=file.content_type,
-                content_disposition=f'attachment; filename="{file.filename}"'
-            )
+            # Write file to disk
+            async with aiofiles.open(target_path, 'wb') as f:
+                await f.write(file_content)
             
-            # Upload with metadata and tags
+            # Build and write metadata sidecar
             metadata = {
                 'original_filename': file.filename or 'unknown',
                 'upload_timestamp': datetime.utcnow().isoformat(),
                 'content_type': file.content_type or 'application/octet-stream',
                 'file_size': str(file_size)
             }
-            
-            # Add custom tags if provided
             if tags:
                 for key, value in tags.items():
-                    if len(key) <= 128 and len(str(value)) <= 256:  # Azure tag limits
-                        metadata[f"tag_{key}"] = str(value)
-            
-            # Upload the blob
-            await blob_client.upload_blob(
-                file_content,
-                overwrite=True,  # Allow overwriting existing blobs
-                content_settings=content_settings,
-                metadata=metadata,
-                timeout=300  # 5 minutes timeout
-            )
+                    metadata[f"tag_{key}"] = str(value)
+
+            meta_path = target_path.with_suffix(target_path.suffix + '.meta.json')
+            async with aiofiles.open(meta_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(metadata))
             
             safe_log("info", f"Successfully uploaded photo: {blob_name} ({file_size} bytes)", "✅", "SUCCESS")
             
             return {
                 'success': True,
                 'blob_name': blob_name,
-                'blob_url': blob_client.url,
+                'blob_url': f"/api/photos/{blob_name}/image",
                 'file_size': file_size,
                 'content_type': file.content_type,
                 'upload_timestamp': datetime.utcnow().isoformat()
@@ -244,24 +180,6 @@ class SecurePhotoUploader:
             
         except HTTPException:
             raise
-        except ClientAuthenticationError as e:
-            safe_log("error", f"Authentication error: {e}", "❌", "AUTH_ERROR")
-            raise HTTPException(
-                status_code=401,
-                detail="Authentication failed. Check your Azure credentials and RBAC permissions."
-            )
-        except ResourceNotFoundError as e:
-            safe_log("error", f"Resource not found: {e}", "❌", "NOT_FOUND")
-            raise HTTPException(
-                status_code=404,
-                detail=f"Storage container '{self.config.container_name}' not found."
-            )
-        except ServiceRequestError as e:
-            safe_log("error", f"Service request error: {e}", "❌", "SERVICE_ERROR")
-            raise HTTPException(
-                status_code=500,
-                detail="Azure Storage service error. Please try again later."
-            )
         except Exception as e:
             safe_log("error", f"Unexpected error during upload: {e}", "❌", "ERROR")
             raise HTTPException(
@@ -269,36 +187,50 @@ class SecurePhotoUploader:
                 detail=f"Upload failed: {str(e)}"
             )
         finally:
-            # Reset file pointer for potential reuse
             await file.seek(0)
     
     async def list_photos(self, limit: int = 50, prefix: str = "") -> List[dict]:
-        """List photos in the storage container"""
+        """List photos in the upload directory"""
         try:
-            blob_service_client = await self._get_blob_service_client()
-            container_client = blob_service_client.get_container_client(self.config.container_name)
-            
             photos = []
-            async for blob in container_client.list_blobs(name_starts_with=prefix):
-                # Skip folder entries (blobs with size 0 and no content type typically represent folders)
-                # Only include actual image files
-                if blob.size > 0 and blob.content_settings and blob.content_settings.content_type:
-                    # Additional check to ensure it's an image file
-                    content_type = blob.content_settings.content_type.lower()
-                    if content_type.startswith('image/'):
-                        photos.append({
-                            'name': blob.name,
-                            'size': blob.size,
-                            'last_modified': blob.last_modified.isoformat() if blob.last_modified else None,
-                            'content_type': blob.content_settings.content_type,
-                            'url': f"{self.config.storage_account_url}/{self.config.container_name}/{blob.name}",
-                            'metadata': blob.metadata or {}
-                        })
-                        
-                        if len(photos) >= limit:
-                            break
+            search_root = self.config.upload_dir / prefix if prefix else self.config.upload_dir
             
-            safe_log("info", f"Listed {len(photos)} photo files (filtered out folders)", "✅", "SUCCESS")
+            if not search_root.exists():
+                return photos
+
+            for file_path in sorted(search_root.rglob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if file_path.suffix.lower() not in self.config.allowed_extensions:
+                    continue
+                if not file_path.is_file():
+                    continue
+                
+                blob_name = file_path.relative_to(self.config.upload_dir).as_posix()
+                
+                # Read sidecar metadata if available
+                meta_path = file_path.with_suffix(file_path.suffix + '.meta.json')
+                metadata = {}
+                if meta_path.exists():
+                    async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
+                        metadata = json.loads(await f.read())
+                
+                content_type = metadata.get('content_type', 'application/octet-stream')
+                if not content_type.startswith('image/'):
+                    continue
+
+                stat = file_path.stat()
+                photos.append({
+                    'name': blob_name,
+                    'size': stat.st_size,
+                    'last_modified': datetime.utcfromtimestamp(stat.st_mtime).isoformat(),
+                    'content_type': content_type,
+                    'url': f"/api/photos/{blob_name}/image",
+                    'metadata': metadata
+                })
+                
+                if len(photos) >= limit:
+                    break
+            
+            safe_log("info", f"Listed {len(photos)} photo files", "✅", "SUCCESS")
             return photos
             
         except Exception as e:
@@ -306,52 +238,53 @@ class SecurePhotoUploader:
             raise HTTPException(status_code=500, detail=f"Failed to list photos: {str(e)}")
     
     async def get_photo_data(self, blob_name: str) -> tuple[bytes, str]:
-        """Get photo data and content type from storage"""
+        """Get photo data and content type from local storage"""
         try:
-            blob_service_client = await self._get_blob_service_client()
-            blob_client = blob_service_client.get_blob_client(
-                container=self.config.container_name,
-                blob=blob_name
-            )
+            file_path = self.config.upload_dir / blob_name
+            if not file_path.exists() or not file_path.is_file():
+                raise HTTPException(status_code=404, detail="Photo not found")
             
-            # Download blob data
-            blob_data = await blob_client.download_blob()
-            content = await blob_data.readall()
+            async with aiofiles.open(file_path, 'rb') as f:
+                content = await f.read()
             
-            # Get blob properties for content type
-            properties = await blob_client.get_blob_properties()
-            content_type = (
-                properties.content_settings.content_type 
-                if properties.content_settings and properties.content_settings.content_type
-                else 'application/octet-stream'
-            )
+            # Determine content type from sidecar or extension
+            meta_path = file_path.with_suffix(file_path.suffix + '.meta.json')
+            content_type = 'application/octet-stream'
+            if meta_path.exists():
+                async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
+                    metadata = json.loads(await f.read())
+                content_type = metadata.get('content_type', content_type)
             
             safe_log("info", f"Retrieved photo data for: {blob_name} ({len(content)} bytes)", "✅", "SUCCESS")
             return content, content_type
             
-        except ResourceNotFoundError:
-            raise HTTPException(status_code=404, detail="Photo not found")
+        except HTTPException:
+            raise
         except Exception as e:
             safe_log("error", f"Error retrieving photo {blob_name}: {e}", "❌", "ERROR")
             raise HTTPException(status_code=500, detail=f"Failed to retrieve photo: {str(e)}")
 
     async def delete_photo(self, blob_name: str) -> bool:
-        """Delete a photo from storage"""
+        """Delete a photo from local storage"""
         try:
-            blob_service_client = await self._get_blob_service_client()
-            blob_client = blob_service_client.get_blob_client(
-                container=self.config.container_name,
-                blob=blob_name
-            )
+            file_path = self.config.upload_dir / blob_name
+            if not file_path.exists() or not file_path.is_file():
+                raise HTTPException(status_code=404, detail="Photo not found")
             
-            await blob_client.delete_blob()
-            logger.info(f"✅ Successfully deleted photo: {blob_name}")
+            file_path.unlink()
+            
+            # Remove sidecar if present
+            meta_path = file_path.with_suffix(file_path.suffix + '.meta.json')
+            if meta_path.exists():
+                meta_path.unlink()
+            
+            safe_log("info", f"Successfully deleted photo: {blob_name}", "✅", "SUCCESS")
             return True
             
-        except ResourceNotFoundError:
-            raise HTTPException(status_code=404, detail="Photo not found")
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"❌ Error deleting photo {blob_name}: {e}")
+            safe_log("error", f"Error deleting photo {blob_name}: {e}", "❌", "ERROR")
             raise HTTPException(status_code=500, detail=f"Failed to delete photo: {str(e)}")
 
 # Initialize the photo uploader
@@ -447,9 +380,13 @@ async def delete_photo_endpoint(blob_name: str):
 async def health_check():
     """Health check endpoint"""
     try:
-        # Test Azure connection
-        await photo_uploader._get_credential()
-        return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+        upload_dir = config.upload_dir
+        return {
+            "status": "healthy",
+            "upload_dir": str(upload_dir),
+            "upload_dir_exists": upload_dir.exists(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
     except Exception as e:
         safe_log("error", f"Health check failed: {e}", "❌", "ERROR")
         return {"status": "unhealthy", "error": str(e), "timestamp": datetime.utcnow().isoformat()}
